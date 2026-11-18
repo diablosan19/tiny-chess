@@ -1,117 +1,73 @@
-# Engine notes — tiny-chess-01 entry
+# Engine notes — tiny-chess-01 entry (v2)
 
-`main.py` is **4,088 bytes** (cap: 4,096), pure Python 3 stdlib, written from
-scratch for this contest. It keeps the kit starter's environment protocol
-exactly (`MAKEFUN_ENV_URL`, POST `/game`, POST `/move`, stop on `done`) and
-replaces the starter's greedy 1-ply brain with a real search engine.
+`main.py` is 4,094 bytes (cap 4,096), stdlib only. It speaks the env
+protocol (`MAKEFUN_ENV_URL`, POST `/game`, POST `/move`, UCI moves) and
+always answers with a move from the env's legal list.
 
 ## Design
 
-- **Board**: 0x88 mailbox — a list of 128 one-char strings in a state list
-  `[board, side_to_move, castling_bitmask, ep_square]`. Square = rank*16+file,
-  rank 0 = rank 1; `s & 0x88` tests off-board.
-- **Moves**: packed ints `from | to<<7 | promo<<14` (promo 1–4 = q r b n).
-  Full legal generation: pawns (single/double push, captures, en passant,
-  all four promotions), knights, sliders, king, and castling with
-  empty-square and not-attacked transit checks. Legality is by make-the-move
-  then test own king with a dedicated attack function (pawn/knight/king steps,
-  then bishop/rook rays; queen = both).
-- **Make/unmake**: snapshot-based — `make` returns `(board[:], turn, castling,
-  ep)` and `unmake` restores by slice assignment. Castling rights are updated
-  through one AND-mask table keyed by from/to home squares.
-- **Search**: negamax alpha-beta (fail-hard). Iterative deepening 1→9 driven
-  by a **fixed node budget — CAP = 25,000 nodes, never a clock** — so a
-  replayed game always produces the same moves. When the budget runs out
-  mid-iteration the search aborts via exception and the best move so far is
-  kept; from depth 2 on, each iteration's root window is seeded just below
-  the previous iteration's best score, so a partial iteration can only
-  *replace* the incumbent with a move that actually beat it.
-- **Quiescence**: at depth ≤ 0, stand-pat plus captures and promotions only.
-  The capture filter lives inside move generation, so quiet moves are skipped
-  before their (expensive) legality test. Capture chains are limited to 4
-  plies to keep the budget for the main search. Mate = −10000 (flat),
-  stalemate = 0.
-- **Move ordering**: captures by MVV-LVA (`victim_value<<5 − attacker_value`),
-  quiet promotions next, root candidates pre-sorted by the same score.
-  (A transposition table and killer moves were implemented in the readable
-  version and cut during golfing — see "With more bytes".)
-- **Evaluation**: material (P100 N300 B320 R500 Q950) + piece-square tables.
-  Tables are stored as single-char strings, `(ord(c) − 107) * 5` per square,
-  and are file-symmetric so only files a–d are stored (32 chars per table).
-  Byte pressure forced sharing: pawns and both minors use the pawn table;
-  rooks, queens and kings use the rook table.
-- **Root safety**: the chosen move is always one of the environment's listed
-  legal moves — engine candidates are intersected with the env list, and any
-  disagreement falls back to the env's first listed move. Repeated calls on
-  the same FEN return the same move regardless of the env list's ordering
-  (verified).
+- 0x88 mailbox board (128 cells), pieces as chars, moves packed into ints
+  (`from | to<<7 | promo<<14 | double<<17`), state = board + side +
+  castling mask + ep square; snapshot make/unmake (copy of 4 fields).
+- Full legal movegen: pseudo-legal generation, then make each move and
+  test the mover's king against a dedicated attack function `A`. Castling
+  checks origin/transit squares and rook presence explicitly.
+- Search: negamax alpha-beta + iterative deepening at the root under a
+  fixed node budget (40,000; no clocks anywhere, so moves are
+  deterministic). Root seeding: each iteration starts from the previous
+  iteration's score, so the played move is only replaced by one that
+  actually beat it inside the current iteration.
+- Transposition table: dict keyed by board string + side (castling/ep not
+  in the key — collisions can only add ordering/score noise, never an
+  illegal move, since the root only plays env-listed moves). Entries hold
+  (depth, score, best move, exact flag); exact scores are returned on
+  probe, best moves give an ordering bonus. Cleared at every root call,
+  which bounds memory and makes each move history-independent.
+- Killer moves: one slot per depth, quiet cutoff moves get a sort bonus.
+- Ordering: TT move, then true MVV-LVA for captures (v1's ordering key
+  was sign-flipped — captures sorted *after* quiet moves; fixed in v2),
+  killers, then everything else.
+- Quiescence: captures + promotions, stand-pat, delta pruning, chain cap
+  4 plies. In-check nodes (main search and qsearch) search all legal
+  replies and score mate as -99999 + ply, so mates are preferred fast.
+- Eval: material + piece-square tables. Two tables are shared
+  (pawns/minors; rooks/queens/king), file-mirrored, encoded as char
+  strings (`(ord-107)*5`); material is folded into the tables, so eval is
+  a single pass over the 64 real squares (~3x faster than v1's 128-cell
+  pass — the speed is what funds the higher node cap).
 
-## Speed (measured on this VM — 1.5 shared vCPU, CPython 3.12)
+## Measurements (this VM: slow shared CPU, CPython 3.12)
 
-- Raw movegen (perft): ~46k–72k nodes/sec.
-- Search at CAP = 25,000: Kiwipete 2.16 s, Italian-game middlegame 1.78 s,
-  queenless endgame 0.49 s per move — worst observed ≈ **2.2 s vs the 10 s
-  limit**, with big headroom for a faster grader machine.
-- On the most tactical positions the budget completes depth 1 and spends the
-  rest on depth 2 over the most promising (capture-first) root moves; quiet
-  positions complete more plies. The partial-iteration rules above mean the
-  extra nodes always improve, never corrupt, the choice.
+Perft, all exact, state restored after every run: startpos d3 8,902 /
+d4 197,281; Kiwipete d3 97,862; ep/pin torture d4 43,238; promotion
+torture d3 9,467; CPW position 5 d3 62,379. Movegen fuzz: 3,600 random
+positions, v2's legal sets identical to v1's. Determinism: identical
+moves across processes with PYTHONHASHSEED 0/1/42.
 
-## Correctness — perft (all with state-restoration asserted after each run)
+Tactics: scholar's mate in 1 (Qxf7#), back-rank mate in 1 (Ra8#),
+hanging queen (Nxh4), and a mate in 2 whose key move was verified by
+brute force (every legal reply allows mate in 1).
 
-| Position | Depth | Nodes | Expected |
-|---|---|---|---|
-| startpos | 3 | 8,902 | 8,902 ✓ |
-| startpos | 4 | 197,281 | 197,281 ✓ |
-| Kiwipete | 3 | 97,862 | 97,862 ✓ |
-| en-passant/pin torture | 4 | 43,238 | 43,238 ✓ |
-| promotion torture | 3 | 9,467 | 9,467 ✓ |
-| CPW position 5 | 3 | 62,379 | 62,379 ✓ |
-| rooks + castling only | 1/2/3 | 26 / 568 / 13,744 | hand-counted, colour-symmetric ✓ |
+Node-cap choice: worst move at 50k nodes took 5.38 s (startpos) — too
+hot. At 40k: startpos 3.75 s, Kiwipete 2.80 s, Sicilian 2.56 s, sharp
+tactical 2.71 s, pawn endgame 1.86 s; a constructed promotion-torture
+outlier takes 6.26 s, still under the 10 s limit. Shipped cap: 40,000.
 
-## Playing tests
+Depth on Kiwipete at shipped caps: v2 completes depth 4 (v1: depth 1).
 
-The kit's harness tarball turned out to be the generic make.fun grading
-platform source (simulation/pricing/grader/server/contracts) — it contains
-**no local chess env server, no Sunfish baseline and no practice openings**,
-so the baseline match was played against the kit starter's own greedy logic
-instead, through a local arbiter (10 opening positions × both colours,
-engine at a reduced 6,000-node cap for speed):
+Matches (10 openings x both colours, mate/stalemate/material/50-move/
+threefold adjudication):
 
-- readable pre-golf engine: **20 W – 0 D – 0 L**
-- final golfed engine: **15 W – 5 D – 0 L** (undefeated; the extra draws are
-  the price of the shared PSTs and the dropped TT/killers)
+- v2 (40k) vs v1 (25k), 20 games: **11W 7D 2L** (72.5%). Both v2 losses
+  came as Black by mate; most draws were threefold repetitions.
+- v2 at a reduced 6,000-node cap vs the kit starter's greedy player,
+  20 games: **16W 4D 0L** (v1 at the same cap: 15W 5D 0L).
 
-Tactical suite on the final file:
+## Known limitations
 
-- mate in 1 (scholar's-mate pattern) → Qxf7#, delivered ✓
-- mate in 1 (back rank) → Ra8#, delivered ✓
-- certified mate in 2 (Philidor-style rook sacrifice, verified by an
-  independent brute-force solver) → engine plays the key move, solver
-  confirms forced mate next move ✓
-- hanging queen → pawn takes queen ✓
-
-Protocol: the real `main.py` was run as a subprocess against a mock env
-server implementing the starter protocol over HTTP — full game played,
-every engine move legal, clean exit when the server reported `done`.
-Self-play games stay fully legal and terminate.
-
-## Known limitations (accepted for bytes)
-
-- Quiescence has no in-check evasion extension: if the side to move is in
-  check and no capture resolves it, stand-pat can be returned.
-- En-passant captures are not searched in quiescence (their target square is
-  empty, so the ordering score is 0 and the capture filter drops them).
-- No draw offers/resign logic — the env ends games; repetition and the
-  50-move rule are the env's business, not modelled in search.
-
-## With more bytes, in order
-
-1. Transposition table (bounded, keyed on a Zobrist hash) — biggest strength
-   per byte; it existed in the readable version and was the last cut.
-2. Killer + history move ordering.
-3. Dedicated bishop, queen and king PSTs (king shelter/endgame split), and
-   restoring the knight table.
-4. In-check quiescence extension and en-passant captures in quiescence.
-5. Null-move pruning and PVS for extra depth at the same node cap.
-6. Small eval terms: bishop pair, doubled/isolated pawns, mobility.
+- No repetition or contempt handling inside the search: drawn-by-
+  repetition finishes happen in near-equal positions.
+- The king still shares the rook/queen PST (a separate king table and
+  an endgame switch did not fit the byte budget after the TT/killers).
+- TT key omits castling rights and ep square; accepted as noise, see
+  above.
