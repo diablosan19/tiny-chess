@@ -1,7 +1,9 @@
 # Engine notes — tiny-chess-01 (v4)
 
-`main.py`: 4,088 bytes (cap 4,096): an lzma payload plus a two-line unpacker,
-which the rules expressly allow (the house baseline ships the same way).
+`main.py`: 3,598 bytes (cap 4,096): packed with `makefun compress` from
+`v4h_src.py` (the readable source, kept beside the repo for the bundle) —
+an lzma payload plus a one-line unpacker, which the rules expressly allow
+(the house baseline ships the same way).
 Stdlib only; fixed node budget, no clocks, no unseeded randomness: a trial
 replays byte for byte (verified).
 
